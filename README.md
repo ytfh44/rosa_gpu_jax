@@ -98,217 +98,412 @@ tau, match_len = lookup_full_l_base(
 
 Use `lookup_full_l_base`.
 
-```python
-import jax.numpy as jnp
-from rosa_gpu_jax import make_raw_causal_aux, lookup_full_l_base
+### Encoding
 
-Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
-K = Q
-B, R, T = Q.shape
-cap_end, successor = make_raw_causal_aux(B, R, T)
+Every length-*L* suffix block ending at position *t* is encoded as a base-σ
+integer via polynomial evaluation:
 
-tau, match_len = lookup_full_l_base(Q, K, cap_end, successor, Lmax=3, sigma=16)
-print(tau)
-print(match_len)
+```
+key_L(t) = Σ_{k=0}^{L−1}  seq[t−k] · σ^{L−1−k}
 ```
 
-This method is exact for `L <= Lmax` if all of the following hold:
+This is a bijection from length-*L* symbol tuples to integers in
+[0, σ^L − 1], assuming 0 ≤ symbol < σ.  Precomputed powers σ^{L−1}, …, σ^0
+make evaluation a dot-product over the last *L* symbols.
 
-- `L_set` is complete: `{1, 2, ..., Lmax}`;
-- exact base encoding and the combined key `block_key * (T + 1) + pos` fit in uint64;
-- `cap_end`, `successor`, and `tau_cap` reproduce the target ROSA/RLE semantics;
-- the symbol alphabet is actually bounded by `0 <= symbol < sigma`.
+### Predecessor search
 
-The public exact lookup APIs now validate these conditions where they can. Unsafe exact-key parameters raise `OverflowError` instead of silently returning corrupted matches. Illegal symbols, bad shapes, invalid `Lmax`, and out-of-range causal caps raise clear errors before JIT execution.
+To locate the rightmost K position whose block key matches the query, each
+key is combined with its position:
 
-It is usually the best first experiment. For `M=4`, `sigma=16`, `Lmax=4` is a more meaningful starting point than sparse grids such as `{1,2,4,8}`, because length-3 matches are common at long context length.
+```
+combined(t) = key_L(t) · (T + 1) + t
+```
+
+The K-side combined keys are sorted.  For each query position *t*, a binary
+search (`searchsorted`) finds the rightmost K combined key below
+`key_L(t) · (T + 1) + cap_end[t]`.  The corresponding K position is the raw
+match end *j*.
+
+### ROSA tie-breaking
+
+The ROSA rule prefers the longest suffix match; for equal length, the
+rightmost occurrence.  The block-table path iterates *L* = 1, 2, …, Lmax,
+accumulating the raw match with largest *L* (breaking ties by largest *j*).
+ROSA successor/tau_cap gating is applied once at the end.
+
+### Properties
+
+- **Exact** for all *L* ≤ Lmax when σ^L · (T + 1) + T ≤ 2^64 − 1 (uint64
+  safe).  This caps Lmax at roughly ⌊64 / log₂ σ⌋.
+- **Complexity** O(B·R·Lmax·T log T) — per-level sort plus binary search
+  over T positions.
+- Public APIs validate uint64 safety and raise `OverflowError` before JIT
+  when constraints are violated.
+- For *M* = 4, σ = 16, Lmax = 4 is a more informative starting point than
+  sparse grids like {1, 2, 4, 8}, because length-3 matches are common at
+  long context length.
 
 ## Method 2: rolling-hash block table
 
 Use `lookup_full_l_rolling`.
 
-```python
-from rosa_gpu_jax import lookup_full_l_rolling
+### Encoding
 
-tau, match_len = lookup_full_l_rolling(
-    Q, K, cap_end, successor, Lmax=16, base=11400714819323198485, tau_cap=tau_cap
-)
+Instead of base-σ encoding, length-*L* blocks are identified by a polynomial
+rolling hash with wrap-around at 2^64:
 
-# For T >= 512, the O(T) hash backend is faster:
-tau, match_len = lookup_full_l_rolling(
-    Q, K, cap_end, successor, Lmax=16, base=257,
-    tau_cap=tau_cap, algorithm="hash"
-)
+```
+P[0]   = 0
+P[t+1] = (P[t] · base + seq[t] + 1)  mod 2^64
 ```
 
-This method uses uint64 overflow rolling hash. It is useful for throughput studies with larger `Lmax`, but it is not a proof of exact ROSA equivalence. To make it exact, add bucket backtracking and raw-symbol tuple verification. Verification must continue to earlier candidates in the same hash bucket if the rightmost hash candidate fails.
+The hash of the length-*L* block ending at *t* is then:
+
+```
+H_L(t) = P[t+1] − P[t−L+1] · base^L   (mod 2^64)
+```
+
+where subtraction exploits unsigned 64-bit overflow for the modulo.  The
++1 offset on each symbol avoids degenerate zero prefixes.
+
+### Lookup
+
+The same predecessor-search pipeline as Method 1 is applied, with rolling
+hashes replacing base-σ keys.  Two backends select the matching strategy:
+
+| backend | complexity | mechanism |
+|---------|-----------|-----------|
+| `"mask"` (default) | O(T²) | mask-multiply over all (t, j) pairs |
+| `"hash"` | O(T) | hash-table probe, O(1) per query |
+
+### Properties
+
+- **Probabilistic** — hash collisions can produce false positives.  No false
+  negatives from the encoding itself.
+- **Large Lmax feasible** — not limited by σ^L < 2^64; can use Lmax = 16, 32, …
+- To make exact, combine with bucket backtracking and raw-symbol tuple
+  verification (see Method 7).
+- The `"hash"` backend achieves ~9× speedup over `"mask"` at T = 1024.
 
 ## Method 3: CPU candidate + GPU verification
 
 Use `verify_cpu_candidates`.
 
-```python
-from rosa_gpu_jax import verify_cpu_candidates
+### Principle
 
-# cand_end[b,r,t,c] is a candidate K end position, or -1 for an empty slot.
-cand_end = jnp.array([[[[0, -1], [1, 0], [2, 1]]]], dtype=jnp.int64)
-tau, best_len = verify_cpu_candidates(Q[:, :, :3], K[:, :, :3], cand_end, Lmax=3)
+A coarse retriever (CPU, heuristic, or external index) proposes a set of
+candidate K end positions `cand_end[b,r,t,:]` for each query position *t*.
+The GPU verifier then checks each candidate symbol-by-symbol and selects the
+best match under ROSA semantics — it does not generate candidates itself.
 
-# For non-raw ROSA/RLE semantics, pass the same auxiliary tensors used by
-# exact lookup:
-tau, best_len = verify_cpu_candidates(
-    Q[:, :, :3],
-    K[:, :, :3],
-    cand_end,
-    Lmax=3,
-    cap_end=cap_end[:, :, :3],
-    successor=successor[:, :, :3],
-    tau_cap=tau_cap[:, :, :3],
-)
+### Verification
+
+For each candidate position *j* and each offset *k* ∈ {0, …, Lmax−1}:
+
+```
+match(L, t, j)  ⇔  ∀k < L:  Q[t−k] = K[j−k]
 ```
 
-This method is exact if the candidate set has full recall and the same `cap_end/successor/tau_cap` tensors are supplied as the exact lookup path. If candidates are top-k or bucket-truncated, all semantic error comes from candidate recall loss, not from the GPU verifier.
+All candidates are evaluated in parallel via broadcasted tensor operations.
+The match length is the number of leading *k* offsets where equality holds
+before the first mismatch (or Lmax if all match).
+
+### Selection and gating
+
+Candidates are scored by `(match_length, rightmost_j)`:
+
+```
+score(j) = match_len · (T + 1) + j
+```
+
+The best-scoring candidate is selected per query position, then gated through
+the ROSA successor/tau_cap pipeline (identical to every other lookup path).
+
+### Properties
+
+- **Exact** when the candidate set has full recall — i.e., the true ROSA
+  raw match is among the candidates for every position.
+- **Error attribution** — when candidates are top-k or bucket-truncated, all
+  semantic error comes from recall loss in the candidate generator, never from
+  the GPU verifier.
+- **Complexity** O(B·R·T·C·Lmax) where C is the number of candidates per
+  position.
 
 
 ## Method 4: Q-bit counterfactual lookup
 
 Use `q_bit_counterfactual_tau`.
 
-```python
-from rosa_gpu_jax import q_bit_counterfactual_tau
+### Principle
 
-tau0, tau1 = q_bit_counterfactual_tau(
-    Q, K, cap_end, successor, Lmax=4, sigma=16, M=4, tau_cap=tau_cap
-)
+For each bit position *m* ∈ {0, …, M−1} of an M-bit symbol alphabet, this
+method asks: *what would τ be if the current query symbol’s m-th bit were
+forced to 0 (resp. 1)?*  It returns two tensors `(tau0, tau1)` where
+`tau0[b,r,t,m]` is the counterfactual τ under bit-forced-to-0 and
+`tau1[b,r,t,m]` under bit-forced-to-1.
+
+### Encoding adjustment
+
+The base-σ block key (Method 1) at position *t* has the current symbol as its
+least significant digit (weight σ^0 = 1).  To force the m-th bit without
+rebuilding the entire block:
+
+```
+forced[t]  = (Q[t] & ~(1<<m))   or   (Q[t] | (1<<m))
+q_key'(t)  = q_key(t) − Q[t] + forced[t]
 ```
 
-This forces the current query symbol bit to 0 or 1 and reuses the exact full-L block lookup. It does not rebuild RLE after the flip. If the target ROSA implementation defines counterfactuals at run level and treats run merge/split specially, integrate that run-level representation before calling this function.
+Only valid query positions (*t* ≥ L−1) are modified; prefix-padded positions
+keep their original (invalid) keys unchanged.
+
+### Reuse
+
+Q-keys and K-keys are precomputed once per *L* and reused across all 2·M
+branch evaluations.  Each branch invokes the exact block-table predecessor
+search (Method 1) on the adjusted Q-keys.
+
+### Properties
+
+- **Exact** under the same uint64 constraints as Method 1.
+- **Does not rebuild RLE** after the bit flip — if the target ROSA
+  implementation treats run merge/split specially under counterfactuals,
+  integrate that run-level representation first.
+- **Complexity** O(B·R·Lmax·M·T log T) — 2·M lookups with precomputed keys.
 
 ## Method 5: dense equality DP exact baseline
 
 Use `lookup_full_l_dp`.
 
-```python
-from rosa_gpu_jax import lookup_full_l_dp, make_raw_causal_aux
+### Recurrence
 
-Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
-K = Q
-B, R, T = Q.shape
-cap_end, successor = make_raw_causal_aux(B, R, T)
+Build the [T × T] boolean equality matrix:
 
-tau, match_len = lookup_full_l_dp(Q, K, cap_end, successor, Lmax=3)
-print(tau)
-print(match_len)
+```
+eq[t, j]  =  (Q[t] == K[j])
 ```
 
-This method computes a full ``[T, T]`` equality matrix and runs a row-by-row
-``lax.scan`` to obtain match lengths ``D[t,j]``.  It is exact for all
-``L <= Lmax``, requires no base/sigma parameters, and is not affected by
-uint64 overflow.  Complexity is ``O(B·R·T²)``; recommended only for
-``T <= 1024`` as a correctness oracle or small-context benchmark.
+Define D[t, j] as the length of the longest suffix of Q[0…t] that is also a
+suffix of K[0…j].  The classic DP recurrence:
+
+```
+           ⎧ D[t−1, j−1] + 1   if eq[t, j]
+D[t, j] =  ⎨
+           ⎩ 0                 otherwise
+```
+
+with boundary D[−1, ·] = D[·, −1] = 0.  This is computed via `lax.scan`,
+which applies the row-by-row update in O(T) sequential steps on GPU.
+
+### Selection
+
+Match lengths are clamped to Lmax, then scored:
+
+```
+score(t, j) = min(D[t,j], Lmax) · (T + 1) + j
+```
+
+For each query row *t*, the *j* with maximum score (longest, then rightmost)
+is selected.  ROSA successor/tau_cap gating is applied as a final step,
+identical to every other lookup path.
+
+### Properties
+
+- **Exact** for all *L* ≤ Lmax — works directly on raw symbols, no encoding
+  or hash collisions.
+- **Sigma-free** — no base/sigma parameter, no uint64 overflow constraint.
+- **Complexity** O(B·R·T²) — recommended only for T ≤ 1024 as a correctness
+  oracle or small-context benchmark.
+- **TPU-friendly** — dense matmul + scan avoids sparse gather/scatter.
 
 ## Method 6: fixed-C postings lookup
 
 Use `lookup_full_l_base_postings` (exact base keys) or
 `lookup_full_l_rolling_postings` (rolling-hash keys).
 
-```python
-from rosa_gpu_jax import lookup_full_l_base_postings, make_raw_causal_aux
+### Principle
 
-Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
-K = Q
-B, R, T = Q.shape
-cap_end, successor = make_raw_causal_aux(B, R, T)
+Methods 1–2 retain only the single rightmost K position per block key.
+This method collects the *C* rightmost matching positions via a multi-offset
+predecessor lookup, then verifies all C candidates symbol-by-symbol.
 
-tau, match_len = lookup_full_l_base_postings(
-    Q, K, cap_end, successor, Lmax=3, sigma=16, C=8
-)
-print(tau)
-print(match_len)
+### Candidate collection
+
+For a query key *q*, let *idx* be the rightmost predecessor index in the
+sorted K combined-key array (same `searchsorted` as Method 1).  The C
+candidates are the positions at sorted indices:
+
+```
+idx,  idx−1,  idx−2,  …,  idx−(C−1)
 ```
 
-These methods extend the block-table approach by collecting the *C* rightmost
-matching positions per unique block key (via ``searchsorted`` + multi-offset
-lookup).  The candidates are then verified symbol-by-symbol and gated through
-the standard ROSA successor/tau_cap pipeline.
+Each candidate is kept only if its block key equals *q* (key match) and its
+position is within the causal cap.  Candidates that fail either check are
+set to −1.
 
-* ``lookup_full_l_base_postings`` is exact when ``C`` is large enough to
-  capture all same-key positions; smaller ``C`` trades a bounded recall
-  risk for more regular memory patterns.
-* ``lookup_full_l_rolling_postings`` uses rolling-hash keys and is
-  probabilistic (hash collisions); combine with tuple verification for
-  exactness.
+### Verification
 
-Both variants accept ``C`` (default 8) and reuse the same ``cap_end`` /
-``successor`` / ``tau_cap`` auxiliaries as every other lookup path.
+The C candidates are verified symbol-by-symbol against raw Q and K symbols
+(identical to the Method 3 verifier).  The best candidate is selected by
+`(match_len, rightmost_j)` scoring and gated through the ROSA
+successor/tau_cap pipeline.
+
+### Variants
+
+- **Base-encoded** (`lookup_full_l_base_postings`) — exact when *C* ≥ the
+  maximum number of positions sharing any single block key.  Smaller *C*
+  trades a bounded recall risk for more regular GPU memory patterns.
+- **Rolling-hash** (`lookup_full_l_rolling_postings`) — probabilistic due to
+  hash collisions; combine with full tuple verification for exactness.
+
+### Properties
+
+- **Complexity** O(B·R·Lmax·(T log T + C·T)) — sorting plus C-offset
+  lookup and C-way verification per level.
+- **C ≥ T** guarantees exactness (but defeats the purpose of postings).
 
 ## Method 7: verified rolling-hash lookup
 
 Use `lookup_full_l_rolling_verified`.
 
-```python
-from rosa_gpu_jax import lookup_full_l_rolling_verified, make_raw_causal_aux
+### Multi-slot hash table
 
-Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
-K = Q
-B, R, T = Q.shape
-cap_end, successor = make_raw_causal_aux(B, R, T)
+Unlike Method 2 (single-slot hash table, one candidate per bucket), this
+method builds a multi-slot table with *C* slots per bucket.
 
-tau, match_len = lookup_full_l_rolling_verified(
-    Q, K, cap_end, successor, Lmax=4, base=257, C=8
-)
+**Insert.** For each K position *t* with rolling hash *h* = H_L(t):
+
+```
+bucket        = h  mod  N_buckets
+slot          = t  mod  C
+combined      = h · (T + 1) + t + 1     (0 = empty sentinel)
+table[bucket, slot]  ←  max(table[bucket, slot], combined)
 ```
 
-This method retains up to *C* candidates per hash bucket (multi-slot table)
-and verifies them symbol-by-symbol against raw K symbols.  No false positives
-from hash collisions; false negatives are possible from bucket collisions
-when ``C`` is too small.
+The per-slot `max` ensures the rightmost position per slot is retained.
+The modulo-based slot assignment distributes positions within a bucket
+deterministically, making it likely that the *C* rightmost entries survive.
+
+**Query.** For each Q position with hash *h*:
+
+```
+bucket = h  mod  N_buckets
+candidates = { table[bucket, 0], …, table[bucket, C−1] }
+```
+
+Each non-zero combined value is decoded to recover the K position *j*.
+All *C* candidates are then verified symbol-by-symbol against raw K symbols
+(identical to the Method 3 verifier).
+
+### Properties
+
+- **No false positives** — every returned match is verified against raw
+  symbols; hash collisions cannot produce spurious matches.
+- **False negatives** possible from bucket collisions when more than *C*
+  positions hash to the same bucket (bucket overflow).
+- **Exact** when *C* ≥ max bucket occupancy; larger *C* trades memory for
+  recall.
+- **Complexity** O(B·R·Lmax·(T + C·T)) — O(T) table build + O(C) probe
+  and verify per position per level.
 
 ## Method 8: bitset exact suffix lookup (experimental)
 
 Use `lookup_full_l_bitset`.
 
-```python
-from rosa_gpu_jax import lookup_full_l_bitset
+### Principle
 
-tau, match_len = lookup_full_l_bitset(
-    Q, K, cap_end, successor, Lmax=3, sigma=16
-)
+For each suffix length *L* ∈ {1, …, Lmax}, build a [T × T] boolean matrix:
+
+```
+R_L[t, j]  =  ⋀_{k=0}^{L−1}  ( Q[t−k] == K[j−k]  ∧  t−k ≥ 0  ∧  j−k ≥ 0 )
 ```
 
-Direct symbol-by-symbol comparison for each query position and suffix length.
-Exact for all ``L <= Lmax``, but O(B·R·T²·Lmax) complexity.  Only suitable
-for tiny ``T`` (<= 32) as a correctness reference.
+That is, R_L[t, j] is true if and only if the length-L suffix ending at Q[t]
+exactly matches the length-L suffix ending at K[j], with all indices in bounds.
+
+### Selection
+
+R_L is gated by the causal cap (*j* < cap_end[t]) and valid block boundaries
+(*j* ≥ L−1, *t* ≥ L−1).  Valid *j* positions are scored by their position
+(rightmost preference), and the best raw match across all *L* is accumulated
+identically to Method 1.
+
+ROSA successor/tau_cap gating is applied as a final step.
+
+### Properties
+
+- **Exact** for all *L* ≤ Lmax — direct symbol comparison, no encoding or
+  hashing.
+- **Complexity** O(B·R·T²·Lmax) — only suitable for tiny T (≤ 32) as a
+  correctness reference.
 
 ## Method 9: dyadic-rank postings + binary-lifting LCE
 
 Use `lookup_full_l_drp_lce`.
 
-```python
-from rosa_gpu_jax import lookup_full_l_drp_lce
+### Dyadic rank encoding
 
-tau, match_len = lookup_full_l_drp_lce(
-    Q, K, cap_end, successor, Lmax=4, C=8, tau_cap=tau_cap
-)
+Instead of base-σ encoding (Method 1), this method builds a hierarchy of
+joint ranks over Q and K symbols that identifies matching blocks of lengths
+1, 2, 4, …, 2^k ≤ Lmax.
+
+**Level 0 (length 1).** Sort all T symbols from Q and T symbols from K
+together; assign each symbol its 1-based position in the sorted order:
+
+```
+rank₀(x)  =  |{ y ∈ Q∪K : y < x }| + 1
 ```
 
-This method builds joint dyadic ranks (length 1, 2, 4, …) over Q and K,
-collects *C* candidate positions per dyadic level via predecessor search,
-then verifies match lengths via binary lifting on the rank hierarchy.
+Two length-1 blocks are equal iff their rank₀ values are equal.
 
-Key properties:
+**Level ℓ (length 2^ℓ).** Given ranks for length 2^{ℓ−1}, encode each
+length-2^ℓ block as a pair:
 
-* **Exact** — no hash collisions, no false positives.
-* **Sigma-free** — does not require a ``sigma`` parameter; no uint64 overflow
-  constraint.  Only depends on ``Lmax`` and ``C``.
-* **O(log Lmax)** verification — binary lifting checks O(log Lmax) dyadic
-  levels instead of O(Lmax) symbol offsets.
-* **C-controlled recall** — ``C >= T`` guarantees exactness; smaller ``C``
-  trades bounded recall for memory regularity.
+```
+pair(t)  =  (rank_{ℓ−1}(t − 2^{ℓ−1}),  rank_{ℓ−1}(t))
+```
 
-This is the *ninth* lookup path.  It is recommended as the first experiment
-when ``Lmax`` is large enough to stress base-σ encoding or when ``sigma``
-is unknown / unbounded.
+Sort all such pairs from Q and K jointly to assign rank_ℓ.  Two length-2^ℓ
+blocks are equal iff their rank_ℓ values are equal (by induction).
+
+Invalid positions (*t* < 2^ℓ − 1) are assigned rank 0.
+
+### Candidate collection
+
+For each dyadic level ℓ (anchor length 2^ℓ), *C* candidate K positions are
+collected via predecessor search on `combined = rank_ℓ · (T+1) + pos`,
+identical to the postings mechanism in Method 6.  Candidates from all levels
+are concatenated, yielding (max_level + 1) · C candidates per query position.
+
+### Binary-lifting LCE verification
+
+The longest common extension (LCE) from each candidate is computed via
+binary lifting on the rank hierarchy — from the highest power of 2 down:
+
+```
+ℓ = max_level, max_level−1, …, 0:
+    if  rank_ℓ[Q, t_q] == rank_ℓ[K, j_k]  AND  bounds ok  AND  length + 2^ℓ ≤ Lmax:
+        length  += 2^ℓ
+        t_q     −= 2^ℓ
+        j_k     −= 2^ℓ
+```
+
+This checks O(log Lmax) dyadic levels instead of O(Lmax) symbol offsets.
+After LCE computation, the best candidate is selected by `(length, rightmost_j)`
+scoring and gated through ROSA successor/tau_cap.
+
+### Properties
+
+- **Exact** — no hash collisions, no false positives.  The dyadic rank
+  hierarchy is a deterministic, collision-free encoding.
+- **Sigma-free** — no `sigma` parameter; no uint64 overflow constraint.
+  Only depends on Lmax and C.
+- **O(log Lmax) verification** — binary lifting over dyadic ranks reduces
+  verification from O(Lmax) to O(log Lmax) per candidate.
+- **C-controlled recall** — C ≥ T guarantees exactness; smaller C trades
+  bounded recall for memory regularity.
+- **Complexity** O(B·R·(log Lmax · T log T + log Lmax · C · T)) — sorting
+  at each of log Lmax levels plus C-way probe and binary-lifting verify.
 
 ## Internal helpers: Bloom filter
 
