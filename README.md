@@ -667,7 +667,7 @@ work that was present in earlier versions.
 ```text
 src/rosa_gpu_jax/
   __init__.py
-  aux.py             raw fallback and official ROSA/RLE auxiliary tensors
+  causal.py             raw fallback and official ROSA/RLE auxiliary tensors
   bitset.py          boolean-array exact suffix lookup (experimental)
   block_table.py     exact full-L base-encoded lookup
   candidates.py      GPU suffix verification for CPU candidates
