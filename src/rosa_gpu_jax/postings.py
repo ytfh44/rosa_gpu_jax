@@ -22,7 +22,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from rosa_gpu_jax.block_table import _block_keys_base_jit, _lookup_one_l_from_keys_end_jit
+from rosa_gpu_jax.block_table import _block_keys_base_jit
 from rosa_gpu_jax.causal import NEG
 from rosa_gpu_jax.rolling_hash import _rolling_block_keys_u64_jit
 from rosa_gpu_jax.validation import (
@@ -119,6 +119,18 @@ def _postings_one_l_from_keys_end_jit(q_keys, k_keys, cap_end, successor, tau_ca
 def _verify_postings_jit(Q, K, cand_end, cap_end, successor, tau_cap, Lmax: int):
     """Verify postings candidates symbol-by-symbol, select best, and gate.
 
+    Returns
+    -------
+    tau : int64[B,R,T]
+        ROSA-gated successor, or ``NEG`` when no valid match exists.
+    best_len : int32[B,R,T]
+        Verified match length after gating (0 when gated out).
+    best_j_raw : int32[B,R,T]
+        Raw best K end position *before* successor/tau_cap gating,
+        or -1 when no raw candidate passes verification.
+    best_len_raw : int32[B,R,T]
+        Verified match length *before* gating.
+
     This is a slightly adapted copy of ``_verify_cpu_candidates_jit``
     so that the postings pipeline stays self-contained and avoids extra
     vmap nesting.
@@ -170,7 +182,12 @@ def _verify_postings_jit(Q, K, cand_end, cap_end, successor, tau_cap, Lmax: int)
         valid_tau = (best_len_raw > 0) & (tau_raw >= 0) & (tau_raw <= tcap)
         tau = jnp.where(valid_tau, tau_raw, NEG)
         best_len = jnp.where(valid_tau, best_len_raw, jnp.int32(0))
-        return tau.astype(jnp.int64), best_len.astype(jnp.int32)
+        return (
+            tau.astype(jnp.int64),
+            best_len.astype(jnp.int32),
+            best_j.astype(jnp.int32),
+            best_len_raw.astype(jnp.int32),
+        )
 
     return jax.vmap(
         jax.vmap(line_verify, in_axes=(0, 0, 0, 0, 0, 0)),
@@ -203,22 +220,29 @@ def _lookup_full_l_base_postings_jit(
         # Verify with the inline verifier (uses Lmax, not L — the verifier
         # checks symbols to the full Lmax depth regardless of which L
         # produced the candidates).
-        tau_L, len_L = _verify_postings_jit(
+        _tau_L, _len_L, end_raw_L, len_raw_L = _verify_postings_jit(
             Q, K, cand_L, cap_end, successor, tau_cap, Lmax=Lmax
         )
-        raw_hit_L = len_L > 0
-
-        # For accumulating raw best: we need the raw end position, not tau.
-        # Extract best_j from cand_L using argmax logic mirroring the verifier.
-        # Simpler: use _lookup_one_l_from_keys_end_jit to get the single
-        # rightmost raw match for this L, then accumulate.
-        _tau_single, _valid, end_single, raw_hit_single = (
-            _lookup_one_l_from_keys_end_jit(
-                q_keys, k_keys, cap_end, successor, tau_cap, L=L
-            )
+        # Guard against padded (zero) block keys for positions t < L-1:
+        # a raw match is only valid when both the query and key positions
+        # are at least L-1 (matching the boundary check in
+        # _lookup_one_l_from_keys_end_jit).
+        pos_t = jnp.arange(T, dtype=jnp.int32)
+        raw_hit_L = (
+            (len_raw_L > 0)
+            & (pos_t[None, None, :] >= (L - 1))
+            & (end_raw_L >= (L - 1))
         )
-        best_end = jnp.where(raw_hit_single, end_single, best_end)
-        best_L_raw = jnp.where(raw_hit_single, jnp.int32(L), best_L_raw)
+
+        # Accumulate raw best across L: the verifier already selected the
+        # best (longest, rightmost) candidate and verified it
+        # symbol-by-symbol.  Use its raw end position and match length
+        # before gating — ROSA gating is applied once at the end, matching
+        # the pattern in _lookup_full_l_base_jit.
+        best_end = jnp.where(
+            raw_hit_L, end_raw_L.astype(jnp.int64), best_end
+        )
+        best_L_raw = jnp.where(raw_hit_L, jnp.int32(L), best_L_raw)
 
     # ROSA gating on the accumulated best raw match.
     end_safe = jnp.clip(best_end, 0, T - 1)
@@ -292,18 +316,24 @@ def _lookup_full_l_rolling_postings_jit(
             q_keys, k_keys, cap_end, successor, tau_cap, L=L, C=C
         )
 
-        # Use mask-based lookup for the single-best raw match (exact for
-        # uint64 keys).  The postings provide candidates; we fall back to
-        # mask for the raw accumulator.
-        from rosa_gpu_jax.block_table import _lookup_one_l_from_keys_mask_end_jit
-
-        _tau_single, _valid, end_single, raw_hit_single = (
-            _lookup_one_l_from_keys_mask_end_jit(
-                q_keys, k_keys, cap_end, successor, tau_cap, L=L
-            )
+        # Verify the C candidates symbol-by-symbol against raw K symbols.
+        # This is the key difference from the earlier rolling-hash path:
+        # hash collisions cannot produce false positives — every returned
+        # match is validated against the actual token stream.
+        _tau_L, _len_L, end_raw_L, len_raw_L = _verify_postings_jit(
+            Q, K, cand_L, cap_end, successor, tau_cap, Lmax=Lmax
         )
-        best_end = jnp.where(raw_hit_single, end_single, best_end)
-        best_L_raw = jnp.where(raw_hit_single, jnp.int32(L), best_L_raw)
+        pos_t = jnp.arange(T, dtype=jnp.int32)
+        raw_hit_L = (
+            (len_raw_L > 0)
+            & (pos_t[None, None, :] >= (L - 1))
+            & (end_raw_L >= (L - 1))
+        )
+
+        best_end = jnp.where(
+            raw_hit_L, end_raw_L.astype(jnp.int64), best_end
+        )
+        best_L_raw = jnp.where(raw_hit_L, jnp.int32(L), best_L_raw)
 
     end_safe = jnp.clip(best_end, 0, T - 1)
     tau_raw = jnp.take_along_axis(successor, end_safe, axis=-1)
