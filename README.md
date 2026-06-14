@@ -11,7 +11,8 @@ This package is not a full ROSA implementation. It isolates several GPU-feasible
 5. dense equality DP exact baseline (small-`T` oracle);
 6. fixed-C postings candidate generator (exact base and rolling-hash variants);
 7. verified rolling-hash lookup with multi-slot hash table;
-8. bitset exact suffix lookup (experimental, small-`T` only).
+8. bitset exact suffix lookup (experimental, small-`T` only);
+9. dyadic-rank postings + binary-lifting LCE lookup (exact, sigma-free).
 
 The package enables JAX x64 at import time, because exact base keys and predecessor-search scores use int64/uint64. The code assumes the core input is already a run-level or token-level symbol stream:
 
@@ -279,6 +280,36 @@ Direct symbol-by-symbol comparison for each query position and suffix length.
 Exact for all ``L <= Lmax``, but O(B·R·T²·Lmax) complexity.  Only suitable
 for tiny ``T`` (<= 32) as a correctness reference.
 
+## Method 9: dyadic-rank postings + binary-lifting LCE
+
+Use `lookup_full_l_drp_lce`.
+
+```python
+from rosa_gpu_jax import lookup_full_l_drp_lce
+
+tau, match_len = lookup_full_l_drp_lce(
+    Q, K, cap_end, successor, Lmax=4, C=8, tau_cap=tau_cap
+)
+```
+
+This method builds joint dyadic ranks (length 1, 2, 4, …) over Q and K,
+collects *C* candidate positions per dyadic level via predecessor search,
+then verifies match lengths via binary lifting on the rank hierarchy.
+
+Key properties:
+
+* **Exact** — no hash collisions, no false positives.
+* **Sigma-free** — does not require a ``sigma`` parameter; no uint64 overflow
+  constraint.  Only depends on ``Lmax`` and ``C``.
+* **O(log Lmax)** verification — binary lifting checks O(log Lmax) dyadic
+  levels instead of O(Lmax) symbol offsets.
+* **C-controlled recall** — ``C >= T`` guarantees exactness; smaller ``C``
+  trades bounded recall for memory regularity.
+
+This is the *ninth* lookup path.  It is recommended as the first experiment
+when ``Lmax`` is large enough to stress base-σ encoding or when ``sigma``
+is unknown / unbounded.
+
 ## Internal helpers: Bloom filter
 
 ```python
@@ -366,7 +397,7 @@ src/rosa_gpu_jax/
   counterfactual.py  Q-bit counterfactual lookup
   dp.py              dense equality DP exact baseline
   filters.py         Bloom negative filter (internal helper)
-  postings.py        fixed-C postings candidate generator
+  postings.py        fixed-C postings + dyadic-rank LCE lookup
   reference.py       slow NumPy reference used by tests
   rolling_hash.py    probabilistic rolling-hash lookup
   rolling_verified.py verified rolling-hash with multi-slot tables

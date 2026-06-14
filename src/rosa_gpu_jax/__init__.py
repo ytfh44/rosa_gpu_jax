@@ -25,6 +25,7 @@ from rosa_gpu_jax.counterfactual import q_bit_counterfactual_tau
 from rosa_gpu_jax.dp import lookup_full_l_dp
 from rosa_gpu_jax.postings import (
     lookup_full_l_base_postings,
+    lookup_full_l_drp_lce,
     lookup_full_l_rolling_postings,
 )
 from rosa_gpu_jax.validation import max_exact_L
@@ -212,6 +213,24 @@ def warmup(
             if verbose:
                 print(f"{t1 - t0:.3f}s")
 
+    # DRP+LCE warmup (sigma-free, only depends on Lmax and C).
+    for Lmax in Lmax_values:
+        if Lmax > T:
+            continue
+        Q_drp = jnp.full((B, R, T), 0, dtype=jnp.int64)
+        K_drp = jnp.full((B, R, T), 1, dtype=jnp.int64)
+        cap_end, successor = make_raw_causal_aux(B, R, T)
+        label_drp = f"drp_lce Lmax={Lmax} C=4"
+        if verbose:
+            print(f"  warming up {label_drp} ...", end=" ", flush=True)
+        t0 = time.perf_counter()
+        lookup_full_l_drp_lce(
+            Q_drp, K_drp, cap_end, successor, Lmax=Lmax, C=4
+        )
+        t1 = time.perf_counter()
+        if verbose:
+            print(f"{t1 - t0:.3f}s")
+
 
 # ---- pmap-based multi-GPU wrappers ----
 
@@ -353,6 +372,7 @@ __all__ = [
     "lookup_full_l_base_pmap",
     "lookup_full_l_dp",
     "lookup_full_l_base_postings",
+    "lookup_full_l_drp_lce",
     "lookup_full_l_rolling_postings",
     "rolling_prefix_u64",
     "rolling_block_keys_u64",

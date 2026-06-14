@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from rosa_gpu_jax import (
     lookup_full_l_base,
     lookup_full_l_base_postings,
+    lookup_full_l_drp_lce,
     lookup_full_l_rolling_postings,
     make_raw_causal_aux,
     make_rosa_causal_aux,
@@ -122,3 +123,146 @@ def test_base_postings_exact_key_overflow_rejected():
         lookup_full_l_base_postings(
             Q, K, cap_end, successor, Lmax=1, sigma=2**63, C=4
         )
+
+
+# ---------------------------------------------------------------------------
+# DRP+LCE tests
+# ---------------------------------------------------------------------------
+
+
+def test_drp_lce_smoke_vs_bruteforce():
+    """DRP+LCE with C=T should exactly match brute force on small random data."""
+    rng = np.random.default_rng(42)
+    B, R, T = 2, 2, 8
+    Lmax = 4
+
+    Q_np = rng.integers(0, 256, size=(B, R, T), dtype=np.int64)
+    K_np = rng.integers(0, 256, size=(B, R, T), dtype=np.int64)
+    K_np[:, :, :4] = Q_np[:, :, :4]
+
+    Q = jnp.asarray(Q_np)
+    K = jnp.asarray(K_np)
+    cap_end, successor = make_raw_causal_aux(B, R, T)
+
+    tau, match_len = lookup_full_l_drp_lce(
+        Q, K, cap_end, successor, Lmax=Lmax, C=T
+    )
+    tau_ref, len_ref = brute_force_lookup(
+        Q_np, K_np, np.array(cap_end), np.array(successor), Lmax=Lmax
+    )
+
+    np.testing.assert_array_equal(np.array(tau), tau_ref)
+    np.testing.assert_array_equal(np.array(match_len), len_ref)
+
+
+def test_drp_lce_rosa_counterexample():
+    """DRP+LCE must respect ROSA no-backtrack semantics."""
+    Z = np.array([[[0, 1, 0, 0]]], dtype=np.int64)
+    cap, succ, tau_cap = make_rosa_causal_aux(jnp.asarray(Z))
+
+    tau, match_len = lookup_full_l_drp_lce(
+        jnp.asarray(Z),
+        jnp.asarray(Z),
+        cap,
+        succ,
+        Lmax=Z.shape[-1],
+        C=Z.shape[-1],
+        tau_cap=tau_cap,
+    )
+
+    expected_tau = rosa_batch_reference_tau(Z)
+    np.testing.assert_array_equal(np.array(tau), expected_tau)
+    np.testing.assert_array_equal(
+        expected_tau, np.array([[[-1, -1, 1, -1]]], dtype=np.int64)
+    )
+    np.testing.assert_array_equal(
+        np.array(match_len), np.array([[[0, 0, 1, 0]]], dtype=np.int32)
+    )
+
+
+def test_drp_lce_with_small_c_nonzero_output():
+    """Even with C=1, DRP+LCE should produce some matches on self-query."""
+    Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+    K = Q
+    B, R, T = Q.shape
+    cap_end, successor = make_raw_causal_aux(B, R, T)
+
+    tau, match_len = lookup_full_l_drp_lce(
+        Q, K, cap_end, successor, Lmax=3, C=1
+    )
+
+    tau_np = np.array(tau)
+    assert np.any(tau_np >= 0), "expected at least one valid match with self-query"
+
+
+def test_drp_lce_shape_and_dtype():
+    """DRP+LCE returns correct shapes and dtypes."""
+    Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+    K = Q
+    B, R, T = Q.shape
+    cap_end, successor = make_raw_causal_aux(B, R, T)
+
+    tau, match_len = lookup_full_l_drp_lce(
+        Q, K, cap_end, successor, Lmax=4, C=4
+    )
+
+    assert tau.shape == (B, R, T)
+    assert match_len.shape == (B, R, T)
+    assert tau.dtype == jnp.int64
+    assert match_len.dtype == jnp.int32
+
+
+def test_drp_lce_lmax_one():
+    """DRP+LCE should work with Lmax=1."""
+    Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+    K = Q
+    B, R, T = Q.shape
+    cap_end, successor = make_raw_causal_aux(B, R, T)
+
+    tau, match_len = lookup_full_l_drp_lce(
+        Q, K, cap_end, successor, Lmax=1, C=4
+    )
+
+    assert tau.shape == (B, R, T)
+    assert match_len.shape == (B, R, T)
+    # For self-query, at positions t>=1 with repeated symbols, we expect matches.
+    tau_np = np.array(tau)
+    assert np.any(tau_np >= 0), "expected at least one L=1 match with self-query"
+
+
+def test_drp_lce_lmax_equals_t():
+    """DRP+LCE should work with Lmax=T."""
+    Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+    K = Q
+    B, R, T = Q.shape
+    cap_end, successor = make_raw_causal_aux(B, R, T)
+
+    tau, match_len = lookup_full_l_drp_lce(
+        Q, K, cap_end, successor, Lmax=T, C=T
+    )
+
+    tau_ref, len_ref = brute_force_lookup(
+        np.array(Q), np.array(K),
+        np.array(cap_end), np.array(successor),
+        Lmax=T
+    )
+    np.testing.assert_array_equal(np.array(tau), tau_ref)
+    np.testing.assert_array_equal(np.array(match_len), len_ref)
+
+
+def test_drp_lce_vs_exact_block_table():
+    """DRP+LCE with C=T should match exact block table results."""
+    Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+    K = Q
+    B, R, T = Q.shape
+    cap_end, successor = make_raw_causal_aux(B, R, T)
+
+    tau_exact, len_exact = lookup_full_l_base(
+        Q, K, cap_end, successor, Lmax=3, sigma=16
+    )
+    tau_drp, len_drp = lookup_full_l_drp_lce(
+        Q, K, cap_end, successor, Lmax=3, C=T
+    )
+
+    np.testing.assert_array_equal(np.array(tau_drp), np.array(tau_exact))
+    np.testing.assert_array_equal(np.array(len_drp), np.array(len_exact))

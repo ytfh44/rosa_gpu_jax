@@ -376,3 +376,272 @@ def lookup_full_l_rolling_postings(
     return _lookup_full_l_rolling_postings_jit(
         Q_arr, K_arr, cap, succ, tcap, Lmax=Lmax_i, base=base_i, C=C_i
     )
+
+
+# ---------------------------------------------------------------------------
+# Dyadic-Rank Postings + binary-lifting LCE lookup
+# ---------------------------------------------------------------------------
+
+
+@partial(jax.jit, static_argnames=("Lmax", "C"))
+def _lookup_drp_lce_line_jit(q, k, cap_end, successor, tau_cap, *, Lmax: int, C: int):
+    """Dyadic-Rank Postings + exact LCE verifier for one [T] line.
+
+    Builds dyadic (power-of-2) joint ranks over Q and K, collects *C*
+    candidate positions per dyadic level via predecessor search, then
+    verifies via binary lifting over the same dyadic ranks.
+
+    This is exact — no false positives.  The only source of false
+    negatives is ``C`` being smaller than the number of same-rank
+    positions at some level.
+
+    Parameters
+    ----------
+    q, k : int64[T]
+        Raw symbol arrays.
+    cap_end, successor, tau_cap : int64[T]
+        ROSA auxiliary tensors.
+
+    Returns
+    -------
+    tau : int64[T]
+    match_len : int32[T]
+    """
+    T = q.shape[0]
+    max_level = int(Lmax).bit_length() - 1
+    rank_stride = jnp.asarray(2 * T + 2, dtype=jnp.int64)
+
+    def _rank_base(q_line, k_line):
+        q_key = q_line.astype(jnp.int64) + 1
+        k_key = k_line.astype(jnp.int64) + 1
+        both = jnp.concatenate([q_key, k_key], axis=0)
+        sorted_both = jnp.sort(both)
+
+        q_rank = (jnp.searchsorted(sorted_both, q_key, side="left") + 1).astype(jnp.int64)
+        k_rank = (jnp.searchsorted(sorted_both, k_key, side="left") + 1).astype(jnp.int64)
+        return q_rank, k_rank
+
+    q_ids = []
+    k_ids = []
+
+    q0, k0 = _rank_base(q, k)
+    q_ids.append(q0)
+    k_ids.append(k0)
+
+    prev_q = q0
+    prev_k = k0
+    prev_len = 1
+
+    # Build dyadic ranks: length 1, 2, 4, ...
+    for _level in range(1, max_level + 1):
+        block_len = prev_len * 2
+        idx = jnp.arange(T, dtype=jnp.int32)
+        left_idx = idx - prev_len
+        valid = idx >= (block_len - 1)
+
+        q_left = prev_q[jnp.clip(left_idx, 0, T - 1)]
+        k_left = prev_k[jnp.clip(left_idx, 0, T - 1)]
+
+        q_pair_key = jnp.where(
+            valid,
+            q_left * rank_stride + prev_q + 1,
+            jnp.int64(0),
+        )
+        k_pair_key = jnp.where(
+            valid,
+            k_left * rank_stride + prev_k + 1,
+            jnp.int64(0),
+        )
+
+        both = jnp.concatenate([q_pair_key, k_pair_key], axis=0)
+        sorted_both = jnp.sort(both)
+
+        q_rank = jnp.where(
+            q_pair_key > 0,
+            (jnp.searchsorted(sorted_both, q_pair_key, side="left") + 1).astype(jnp.int64),
+            jnp.int64(0),
+        )
+        k_rank = jnp.where(
+            k_pair_key > 0,
+            (jnp.searchsorted(sorted_both, k_pair_key, side="left") + 1).astype(jnp.int64),
+            jnp.int64(0),
+        )
+
+        q_ids.append(q_rank)
+        k_ids.append(k_rank)
+        prev_q = q_rank
+        prev_k = k_rank
+        prev_len = block_len
+
+    def _candidates_for_level(qid, kid, anchor_len: int):
+        pos = jnp.arange(T, dtype=jnp.int64)
+        pos_stride = jnp.asarray(T + 1, dtype=jnp.int64)
+
+        combined = kid * pos_stride + pos
+        order = jnp.argsort(combined, stable=False)
+
+        combined_s = combined[order]
+        key_s = kid[order]
+        pos_s = pos[order]
+
+        cap = jnp.clip(cap_end, 0, T).astype(jnp.int64)
+        bound = qid * pos_stride + cap
+
+        base_idx = (jnp.searchsorted(combined_s, bound, side="left") - 1).astype(jnp.int64)
+        offsets = jnp.arange(C, dtype=jnp.int64)
+        idxs = base_idx[:, None] - offsets[None, :]
+        idxs_clip = jnp.clip(idxs, 0, T - 1)
+
+        cand_pos = pos_s[idxs_clip]
+        ok = (
+            (idxs >= 0)
+            & (qid[:, None] > 0)
+            & (key_s[idxs_clip] == qid[:, None])
+            & (cand_pos < cap[:, None])
+            & (cand_pos >= anchor_len - 1)
+        )
+
+        return jnp.where(ok, cand_pos, jnp.int64(-1))
+
+    # Collect candidate positions from every dyadic level.
+    cand_blocks = []
+    for level in range(max_level + 1):
+        anchor_len = 1 << level
+        cand_blocks.append(_candidates_for_level(q_ids[level], k_ids[level], anchor_len))
+
+    cand = jnp.concatenate(cand_blocks, axis=1)  # [T, (max_level+1) * C]
+    NC = cand.shape[1]
+
+    # Exact LCE via binary lifting on dyadic ranks.
+    t0 = jnp.arange(T, dtype=jnp.int64)[:, None]
+    j0 = cand.astype(jnp.int64)
+    cap_t = jnp.clip(cap_end, 0, T).astype(jnp.int64)[:, None]
+
+    active = (j0 >= 0) & (j0 < cap_t)
+
+    tq = jnp.broadcast_to(t0, (T, NC))
+    jk = j0
+    length = jnp.zeros((T, NC), dtype=jnp.int32)
+
+    for level in range(max_level, -1, -1):
+        step_len = 1 << level
+
+        qid = q_ids[level]
+        kid = k_ids[level]
+
+        tq_clip = jnp.clip(tq, 0, T - 1).astype(jnp.int32)
+        jk_clip = jnp.clip(jk, 0, T - 1).astype(jnp.int32)
+
+        same = qid[tq_clip] == kid[jk_clip]
+        can_take = (
+            active
+            & (tq >= step_len - 1)
+            & (jk >= step_len - 1)
+            & ((length.astype(jnp.int64) + step_len) <= Lmax)
+            & same
+        )
+
+        length = length + jnp.where(can_take, jnp.int32(step_len), jnp.int32(0))
+        delta = jnp.where(can_take, jnp.int64(step_len), jnp.int64(0))
+
+        tq = tq - delta
+        jk = jk - delta
+
+    raw_len = jnp.where(active, length, jnp.int32(0))
+
+    # Select longest, then rightmost raw match.
+    j_nonneg = jnp.maximum(j0, 0)
+    score = raw_len.astype(jnp.int64) * jnp.asarray(T + 1, dtype=jnp.int64) + j_nonneg
+    score = jnp.where(raw_len > 0, score, NEG)
+
+    best_idx = jnp.argmax(score, axis=1).astype(jnp.int32)
+    best_score = jnp.take_along_axis(score, best_idx[:, None], axis=1)[:, 0]
+    best_j = jnp.take_along_axis(cand, best_idx[:, None], axis=1)[:, 0].astype(jnp.int64)
+    best_len_raw = jnp.take_along_axis(raw_len, best_idx[:, None], axis=1)[:, 0]
+
+    raw_hit = best_score > NEG
+    best_j_safe = jnp.clip(best_j, 0, T - 1).astype(jnp.int32)
+
+    tau_raw = successor[best_j_safe]
+    final_hit = raw_hit & (tau_raw >= 0) & (tau_raw <= tau_cap)
+
+    tau = jnp.where(final_hit, tau_raw, NEG).astype(jnp.int64)
+    match_len = jnp.where(final_hit, best_len_raw, jnp.int32(0))
+
+    return tau, match_len
+
+
+@partial(jax.jit, static_argnames=("Lmax", "C"))
+def _lookup_drp_lce_jit(Q, K, cap_end, successor, tau_cap, *, Lmax: int, C: int):
+    """Batched [B,R,T] wrapper around ``_lookup_drp_lce_line_jit``."""
+
+    def one_line(q, k, ce, succ, tc):
+        return _lookup_drp_lce_line_jit(q, k, ce, succ, tc, Lmax=Lmax, C=C)
+
+    return jax.vmap(
+        jax.vmap(one_line, in_axes=(0, 0, 0, 0, 0)),
+        in_axes=(0, 0, 0, 0, 0),
+    )(Q, K, cap_end, successor, tau_cap)
+
+
+def lookup_full_l_drp_lce(
+    Q,
+    K,
+    cap_end,
+    successor,
+    *,
+    Lmax: int,
+    C: int = 8,
+    tau_cap=None,
+    validate_symbols: bool = True,
+):
+    """Dyadic-Rank Postings + binary-lifting LCE suffix lookup.
+
+    Builds a hierarchy of joint dyadic ranks (length 1, 2, 4, ... up to
+    the largest power of two ≤ ``Lmax``), collects *C* candidate
+    positions per dyadic level via predecessor search, then verifies
+    match lengths via binary lifting on the rank hierarchy.
+
+    Unlike ``lookup_full_l_base_postings`` this method does **not**
+    require a ``sigma`` parameter and has no uint64 overflow constraint.
+    Unlike ``lookup_full_l_rolling_postings`` it is exact — no hash
+    collisions.  The only source of false negatives is ``C`` being
+    smaller than the number of same-rank positions.
+
+    Complexity is ``O(log Lmax · T log T + log Lmax · C · T)`` per line,
+    compared to ``O(Lmax · T log T + Lmax · C · T)`` for the per-L
+    postings path.
+
+    Parameters
+    ----------
+    Q, K:
+        Integer ``[B, R, T]`` symbol streams.
+    cap_end, successor:
+        ROSA auxiliary tensors (see :func:`make_rosa_causal_aux`).
+    Lmax:
+        Maximum suffix length to consider.  Must satisfy ``1 <= Lmax <= T``.
+    C:
+        Number of candidates retained per dyadic level.  Larger values
+        reduce false negatives.  ``C >= T`` guarantees exactness.
+    tau_cap:
+        Optional post-successor cap for official ROSA/RLE semantics.
+    validate_symbols:
+        When ``True`` (default), validate that symbols are in range.
+
+    Returns
+    -------
+    tau:
+        ``int64[B, R, T]`` — ROSA tau (next-run start), or ``-1``.
+    match_len:
+        ``int32[B, R, T]`` — length of the accepted raw suffix match.
+    """
+    Q_arr, K_arr, _B, _R, T = require_rank3_pair(
+        Q, K, sigma=None, validate_symbols=validate_symbols
+    )
+    Lmax_i = require_Lmax_for_T(Lmax, T)
+    C_i = max(1, int(C))
+    cap, succ = require_aux(cap_end, successor, shape=tuple(Q_arr.shape))
+    tcap = require_tau_cap(tau_cap, shape=tuple(Q_arr.shape))
+    return _lookup_drp_lce_jit(
+        Q_arr, K_arr, cap, succ, tcap, Lmax=Lmax_i, C=C_i
+    )
