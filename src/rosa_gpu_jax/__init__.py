@@ -37,6 +37,7 @@ from rosa_gpu_jax.rolling_hash import (
 from rosa_gpu_jax.rolling_verified import lookup_full_l_rolling_verified
 from rosa_gpu_jax.bitset import lookup_full_l_bitset  # experimental
 from rosa_gpu_jax.dp_tpu import lookup_full_l_dense_tpu  # TPU benchmark
+from rosa_gpu_jax.suffix_tree_lookup import lookup_full_l_sa, suffix_array_batch  # SA-based
 
 
 def warmup(
@@ -153,6 +154,22 @@ def warmup(
             print(f"  warming up {label_dp} ...", end=" ", flush=True)
         t0 = time.perf_counter()
         lookup_full_l_dp(Q_dp, K_dp, cap_end, successor, Lmax=Lmax_dp)
+        t1 = time.perf_counter()
+        if verbose:
+            print(f"{t1 - t0:.3f}s")
+
+    # SA lookup warmup.
+    for Lmax in Lmax_values:
+        if Lmax > T:
+            continue
+        Q_sa = jnp.full((B, R, T), 0, dtype=jnp.int64)
+        K_sa = jnp.full((B, R, T), 1, dtype=jnp.int64)
+        cap_end, successor = make_raw_causal_aux(B, R, T)
+        label_sa = f"sa Lmax={Lmax}"
+        if verbose:
+            print(f"  warming up {label_sa} ...", end=" ", flush=True)
+        t0 = time.perf_counter()
+        lookup_full_l_sa(Q_sa, K_sa, cap_end, successor, Lmax=Lmax)
         t1 = time.perf_counter()
         if verbose:
             print(f"{t1 - t0:.3f}s")
@@ -345,6 +362,8 @@ __all__ = [
     "lookup_full_l_rolling_verified",
     "lookup_full_l_bitset",  # experimental
     "lookup_full_l_dense_tpu",  # TPU benchmark
+    "lookup_full_l_sa",  # suffix-array based
+    "suffix_array_batch",
     "verify_cpu_candidates",
     "q_bit_counterfactual_tau",
     "max_exact_L",
