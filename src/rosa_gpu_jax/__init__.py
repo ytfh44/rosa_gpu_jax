@@ -22,6 +22,11 @@ from rosa_gpu_jax.block_table import (
 )
 from rosa_gpu_jax.candidates import verify_cpu_candidates
 from rosa_gpu_jax.counterfactual import q_bit_counterfactual_tau
+from rosa_gpu_jax.dp import lookup_full_l_dp
+from rosa_gpu_jax.postings import (
+    lookup_full_l_base_postings,
+    lookup_full_l_rolling_postings,
+)
 from rosa_gpu_jax.validation import max_exact_L
 from rosa_gpu_jax.rolling_hash import (
     lookup_full_l_rolling,
@@ -29,6 +34,9 @@ from rosa_gpu_jax.rolling_hash import (
     rolling_block_keys_u64,
     rolling_prefix_u64,
 )
+from rosa_gpu_jax.rolling_verified import lookup_full_l_rolling_verified
+from rosa_gpu_jax.bitset import lookup_full_l_bitset  # experimental
+from rosa_gpu_jax.dp_tpu import lookup_full_l_dense_tpu  # TPU benchmark
 
 
 def warmup(
@@ -133,6 +141,59 @@ def warmup(
         t1 = time.perf_counter()
         if verbose:
             print(f"{t1 - t0:.3f}s")
+
+    # DP warmup.
+    Lmax_dp = min(max(Lmax_values), T)
+    if Lmax_dp >= 1:
+        Q_dp = jnp.full((B, R, T), 0, dtype=jnp.int64)
+        K_dp = jnp.full((B, R, T), 1, dtype=jnp.int64)
+        cap_end, successor = make_raw_causal_aux(B, R, T)
+        label_dp = f"dp Lmax={Lmax_dp}"
+        if verbose:
+            print(f"  warming up {label_dp} ...", end=" ", flush=True)
+        t0 = time.perf_counter()
+        lookup_full_l_dp(Q_dp, K_dp, cap_end, successor, Lmax=Lmax_dp)
+        t1 = time.perf_counter()
+        if verbose:
+            print(f"{t1 - t0:.3f}s")
+
+    # Postings warmup (base + rolling).
+    for Lmax in Lmax_values:
+        for sigma in sigma_values:
+            if Lmax > T:
+                continue
+            safe_Lmax = max_exact_L(sigma, T)
+            Lmax_eff = min(Lmax, safe_Lmax)
+            if Lmax_eff < 1:
+                continue
+            Q_p = jnp.full((B, R, T), 0, dtype=jnp.int64)
+            K_p = jnp.full((B, R, T), 1, dtype=jnp.int64)
+            cap_end, successor = make_raw_causal_aux(B, R, T)
+            label_bp = f"base_postings Lmax={Lmax_eff} sigma={sigma} C=4"
+            if verbose:
+                print(f"  warming up {label_bp} ...", end=" ", flush=True)
+            t0 = time.perf_counter()
+            lookup_full_l_base_postings(
+                Q_p, K_p, cap_end, successor, Lmax=Lmax_eff, sigma=sigma, C=4
+            )
+            t1 = time.perf_counter()
+            if verbose:
+                print(f"{t1 - t0:.3f}s")
+
+        if Lmax <= T:
+            Q_rp = jnp.full((B, R, T), 0, dtype=jnp.int64)
+            K_rp = jnp.full((B, R, T), 1, dtype=jnp.int64)
+            cap_end, successor = make_raw_causal_aux(B, R, T)
+            label_rp = f"rolling_postings Lmax={Lmax} base={base_for_rolling} C=4"
+            if verbose:
+                print(f"  warming up {label_rp} ...", end=" ", flush=True)
+            t0 = time.perf_counter()
+            lookup_full_l_rolling_postings(
+                Q_rp, K_rp, cap_end, successor, Lmax=Lmax, base=base_for_rolling, C=4
+            )
+            t1 = time.perf_counter()
+            if verbose:
+                print(f"{t1 - t0:.3f}s")
 
 
 # ---- pmap-based multi-GPU wrappers ----
@@ -273,11 +334,17 @@ __all__ = [
     "lookup_one_l_base",
     "lookup_full_l_base",
     "lookup_full_l_base_pmap",
+    "lookup_full_l_dp",
+    "lookup_full_l_base_postings",
+    "lookup_full_l_rolling_postings",
     "rolling_prefix_u64",
     "rolling_block_keys_u64",
     "lookup_one_l_rolling",
     "lookup_full_l_rolling",
     "lookup_full_l_rolling_pmap",
+    "lookup_full_l_rolling_verified",
+    "lookup_full_l_bitset",  # experimental
+    "lookup_full_l_dense_tpu",  # TPU benchmark
     "verify_cpu_candidates",
     "q_bit_counterfactual_tau",
     "max_exact_L",

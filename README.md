@@ -7,7 +7,11 @@ This package is not a full ROSA implementation. It isolates several GPU-feasible
 1. full-L exact block table lookup within `L <= Lmax`;
 2. rolling-hash block table lookup for larger `Lmax` throughput experiments;
 3. CPU-candidate + GPU suffix verification;
-4. Q-bit counterfactual destination lookup for the current query symbol.
+4. Q-bit counterfactual destination lookup for the current query symbol;
+5. dense equality DP exact baseline (small-`T` oracle);
+6. fixed-C postings candidate generator (exact base and rolling-hash variants);
+7. verified rolling-hash lookup with multi-slot hash table;
+8. bitset exact suffix lookup (experimental, small-`T` only).
 
 The package enables JAX x64 at import time, because exact base keys and predecessor-search scores use int64/uint64. The code assumes the core input is already a run-level or token-level symbol stream:
 
@@ -164,6 +168,7 @@ tau, best_len = verify_cpu_candidates(
 
 This method is exact if the candidate set has full recall and the same `cap_end/successor/tau_cap` tensors are supplied as the exact lookup path. If candidates are top-k or bucket-truncated, all semantic error comes from candidate recall loss, not from the GPU verifier.
 
+
 ## Method 4: Q-bit counterfactual lookup
 
 Use `q_bit_counterfactual_tau`.
@@ -177,6 +182,111 @@ tau0, tau1 = q_bit_counterfactual_tau(
 ```
 
 This forces the current query symbol bit to 0 or 1 and reuses the exact full-L block lookup. It does not rebuild RLE after the flip. If the target ROSA implementation defines counterfactuals at run level and treats run merge/split specially, integrate that run-level representation before calling this function.
+
+## Method 5: dense equality DP exact baseline
+
+Use `lookup_full_l_dp`.
+
+```python
+from rosa_gpu_jax import lookup_full_l_dp, make_raw_causal_aux
+
+Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+K = Q
+B, R, T = Q.shape
+cap_end, successor = make_raw_causal_aux(B, R, T)
+
+tau, match_len = lookup_full_l_dp(Q, K, cap_end, successor, Lmax=3)
+print(tau)
+print(match_len)
+```
+
+This method computes a full ``[T, T]`` equality matrix and runs a row-by-row
+``lax.scan`` to obtain match lengths ``D[t,j]``.  It is exact for all
+``L <= Lmax``, requires no base/sigma parameters, and is not affected by
+uint64 overflow.  Complexity is ``O(B·R·T²)``; recommended only for
+``T <= 1024`` as a correctness oracle or small-context benchmark.
+
+## Method 6: fixed-C postings lookup
+
+Use `lookup_full_l_base_postings` (exact base keys) or
+`lookup_full_l_rolling_postings` (rolling-hash keys).
+
+```python
+from rosa_gpu_jax import lookup_full_l_base_postings, make_raw_causal_aux
+
+Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+K = Q
+B, R, T = Q.shape
+cap_end, successor = make_raw_causal_aux(B, R, T)
+
+tau, match_len = lookup_full_l_base_postings(
+    Q, K, cap_end, successor, Lmax=3, sigma=16, C=8
+)
+print(tau)
+print(match_len)
+```
+
+These methods extend the block-table approach by collecting the *C* rightmost
+matching positions per unique block key (via ``searchsorted`` + multi-offset
+lookup).  The candidates are then verified symbol-by-symbol and gated through
+the standard ROSA successor/tau_cap pipeline.
+
+* ``lookup_full_l_base_postings`` is exact when ``C`` is large enough to
+  capture all same-key positions; smaller ``C`` trades a bounded recall
+  risk for more regular memory patterns.
+* ``lookup_full_l_rolling_postings`` uses rolling-hash keys and is
+  probabilistic (hash collisions); combine with tuple verification for
+  exactness.
+
+Both variants accept ``C`` (default 8) and reuse the same ``cap_end`` /
+``successor`` / ``tau_cap`` auxiliaries as every other lookup path.
+
+## Method 7: verified rolling-hash lookup
+
+Use `lookup_full_l_rolling_verified`.
+
+```python
+from rosa_gpu_jax import lookup_full_l_rolling_verified, make_raw_causal_aux
+
+Q = jnp.array([[[1, 2, 3, 1, 2, 3, 4, 1]]], dtype=jnp.int64)
+K = Q
+B, R, T = Q.shape
+cap_end, successor = make_raw_causal_aux(B, R, T)
+
+tau, match_len = lookup_full_l_rolling_verified(
+    Q, K, cap_end, successor, Lmax=4, base=257, C=8
+)
+```
+
+This method retains up to *C* candidates per hash bucket (multi-slot table)
+and verifies them symbol-by-symbol against raw K symbols.  No false positives
+from hash collisions; false negatives are possible from bucket collisions
+when ``C`` is too small.
+
+## Method 8: bitset exact suffix lookup (experimental)
+
+Use `lookup_full_l_bitset`.
+
+```python
+from rosa_gpu_jax import lookup_full_l_bitset
+
+tau, match_len = lookup_full_l_bitset(
+    Q, K, cap_end, successor, Lmax=3, sigma=16
+)
+```
+
+Direct symbol-by-symbol comparison for each query position and suffix length.
+Exact for all ``L <= Lmax``, but O(B·R·T²·Lmax) complexity.  Only suitable
+for tiny ``T`` (<= 32) as a correctness reference.
+
+## Internal helpers: Bloom filter
+
+```python
+from rosa_gpu_jax.filters import bloom_filter_keys, bloom_query_keys
+```
+
+A simple 2-hash Bloom filter for pre-screening block keys.  Designed as an
+inexpensive pre-check for the postings or rolling-verified paths.
 
 ## Performance optimization guide
 
@@ -250,18 +360,28 @@ work that was present in earlier versions.
 src/rosa_gpu_jax/
   __init__.py
   aux.py             raw fallback and official ROSA/RLE auxiliary tensors
+  bitset.py          boolean-array exact suffix lookup (experimental)
   block_table.py     exact full-L base-encoded lookup
-  rolling_hash.py    probabilistic rolling-hash lookup
   candidates.py      GPU suffix verification for CPU candidates
   counterfactual.py  Q-bit counterfactual lookup
+  dp.py              dense equality DP exact baseline
+  filters.py         Bloom negative filter (internal helper)
+  postings.py        fixed-C postings candidate generator
   reference.py       slow NumPy reference used by tests
+  rolling_hash.py    probabilistic rolling-hash lookup
+  rolling_verified.py verified rolling-hash with multi-slot tables
+  validation.py      input validation helpers
 examples/
   smoke_test.py
 tests/
+  test_bitset.py
   test_block_table.py
   test_candidates.py
   test_counterfactual.py
+  test_dp.py
   test_official_rosa_semantics.py
+  test_postings.py
+  test_rolling_verified.py
 ```
 
 ## Important limitations
