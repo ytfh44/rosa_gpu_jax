@@ -12,7 +12,9 @@ This package is not a full ROSA implementation. It isolates several GPU-feasible
 6. fixed-C postings candidate generator (exact base and rolling-hash variants);
 7. verified rolling-hash lookup with multi-slot hash table;
 8. bitset exact suffix lookup (experimental, small-`T` only);
-9. dyadic-rank postings + binary-lifting LCE lookup (exact, sigma-free).
+9. dyadic-rank postings + binary-lifting LCE lookup (exact, sigma-free);
+10. streaming diagonal-DP lookup (reduced-memory exact oracle);
+11. Shift-And bitset exact suffix lookup (no sort, no hash, no overflow).
 
 The package enables JAX x64 at import time, because exact base keys and predecessor-search scores use int64/uint64. The code assumes the core input is already a run-level or token-level symbol stream:
 
@@ -505,6 +507,86 @@ scoring and gated through ROSA successor/tau_cap.
 - **Complexity** O(B·R·(log Lmax · T log T + log Lmax · C · T)) — sorting
   at each of log Lmax levels plus C-way probe and binary-lifting verify.
 
+## Method 10: streaming diagonal-DP lookup
+
+Use `lookup_full_l_diag_dp`.
+
+### Principle
+
+Identical recurrence to the dense DP (Method 5), but only the previous row
+``D_prev[T]`` is kept:
+
+```
+D_curr[j] = D_prev[j-1] + 1   if Q[t] == K[j]
+            0                  otherwise
+```
+
+Memory drops from O(T²) to O(T).  A `lax.scan` over time steps carries the
+single-row state, and for each query position the best raw match (longest,
+then rightmost) is selected and gated through the ROSA successor/tau_cap
+pipeline.
+
+### Properties
+
+- **Exact** for all L ≤ Lmax — works directly on raw symbols, no encoding
+  or hash collisions.
+- **Sigma-free** — no base/sigma parameter, no uint64 overflow constraint.
+- **Complexity** O(B·R·T²) time, O(B·R·T) memory.  Same asymptotics as
+  dense DP but with drastically lower memory.  Recommended for T ≤ 1024
+  as a correctness oracle.
+- **TPU-friendly** — dense scan operations avoid sparse gather/scatter.
+
+## Method 11: Shift-And bitset exact lookup
+
+Use `lookup_full_l_shift_and`.
+
+### Principle
+
+The classic bit-parallel Shift-And string-matching algorithm is adapted to
+ROSA suffix predecessor queries.  For each symbol ``a``, a multi-word bitset
+``P_a`` records every K position where the symbol occurs.  A per-length
+bitset ``M_L(t)`` tracks K positions whose length-L suffix matches Q ending
+at time ``t``:
+
+```
+M_1(t)    = P_{Q[t]}
+M_L(t)    = (M_{L-1}(t-1) << 1)  &  P_{Q[t]}      (L > 1)
+```
+
+The `<< 1` shifts match positions forward by one (crossing word boundaries),
+and `& P_{Q[t]}` requires the current symbol to match.
+
+ROSA rightmost predecessor becomes a single `highest_set_bit` query on the
+masked bitset ``M_L(t) & cap_mask(cap_end[t])``.  No sorting, no hashing,
+and no base-σ encoding are needed.
+
+### Selection and gating
+
+For each time ``t``, the longest length ``L`` with a non-empty masked bitset
+is selected.  The highest set bit in that bitset is the rightmost matching
+K end position ``j``.  ROSA successor/tau_cap gating is applied identically
+to every other lookup path.
+
+### Comparison with existing `bitset.py` (Method 8)
+
+The existing ``bitset.py`` constructs a ``[T, T]`` boolean matrix per ``L``
+and has complexity O(B·R·T²·Lmax²).  Shift-And instead maintains only
+``Lmax`` multi-word bitsets and has complexity O(B·R·Lmax·T·ceil(T/64)).
+
+### Properties
+
+- **Exact** — no hash collisions, no false positives, no base-key overflow.
+- **No sort required** — uses only bitwise operations (`&`, `<<`, binary
+  search for highest-set-bit).
+- **Streaming-friendly** — each new symbol needs O(Lmax·W) bitwise ops.
+- **Complexity** O(B·R·Lmax·T·ceil(T/64)) time,
+  O(B·R·Lmax·ceil(T/64)) memory.
+- **Best at**: moderate T, large Lmax, small alphabet, exactness required,
+  and when sorting/hashing overhead should be avoided.
+- **Compared to base block table**: at small T and Lmax the base-sort path
+  may still be faster due to lower constants; at larger Lmax Shift-And's
+  per-level constant-cost bitwise operations begin to dominate.
+
 ## Internal helpers: Bloom filter
 
 ```python
@@ -590,12 +672,14 @@ src/rosa_gpu_jax/
   block_table.py     exact full-L base-encoded lookup
   candidates.py      GPU suffix verification for CPU candidates
   counterfactual.py  Q-bit counterfactual lookup
+  diag_dp.py         streaming diagonal-DP exact lookup
   dp.py              dense equality DP exact baseline
   filters.py         Bloom negative filter (internal helper)
   postings.py        fixed-C postings + dyadic-rank LCE lookup
   reference.py       slow NumPy reference used by tests
   rolling_hash.py    probabilistic rolling-hash lookup
   rolling_verified.py verified rolling-hash with multi-slot tables
+  shift_and.py       Shift-And bitset exact lookup
   validation.py      input validation helpers
 examples/
   smoke_test.py

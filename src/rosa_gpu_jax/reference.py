@@ -207,3 +207,172 @@ def rosa_batch_reference_tau(Z) -> np.ndarray:
         for r in range(R):
             out[b, r] = rosa_one_sequence_reference_tau(Z[b, r])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Reference: streaming diagonal-DP
+# ---------------------------------------------------------------------------
+
+
+def diag_dp_reference(Q, K, cap_end, successor, Lmax: int, tau_cap=None):
+    """Streaming diagonal-DP reference for tests.
+
+    Maintains only the previous row ``D_prev[T]``, reducing memory from
+    ``O(T²)`` (dense DP) to ``O(T)``.  Semantics are identical to
+    ``brute_force_lookup``.
+    """
+    Q = np.asarray(Q)
+    K = np.asarray(K)
+    cap_end = np.asarray(cap_end)
+    successor = np.asarray(successor)
+    if tau_cap is None:
+        tau_cap = _default_tau_cap(Q.shape)
+    else:
+        tau_cap = np.asarray(tau_cap)
+
+    B, R, T = Q.shape
+    tau = np.full((B, R, T), -1, dtype=np.int64)
+    best_L_out = np.zeros((B, R, T), dtype=np.int32)
+
+    for b in range(B):
+        for r in range(R):
+            q_line = Q[b, r]
+            k_line = K[b, r]
+            cap_line = cap_end[b, r]
+            succ_line = successor[b, r]
+            tc_line = tau_cap[b, r]
+
+            # D_prev[j] = length of longest suffix of Q[0..t-1] ending at K[j]
+            D_prev = np.zeros(T, dtype=np.int32)
+
+            for t in range(T):
+                # Shift D_prev right by 1, pad with 0 at position 0.
+                D_curr = np.zeros(T, dtype=np.int32)
+                D_curr[1:] = D_prev[:-1]
+                eq = (q_line[t] == k_line).astype(np.int32)
+                D_curr = np.where(eq, D_curr + 1, 0)
+
+                # Clamp to Lmax.
+                D_curr = np.minimum(D_curr, np.int32(Lmax))
+
+                # Select raw best: longest length, then rightmost j.
+                cap_t = max(0, min(int(cap_line[t]), T))
+                best_len = 0
+                best_j = -1
+                for j in range(cap_t):
+                    lj = int(D_curr[j])
+                    if lj > best_len:
+                        best_len = lj
+                        best_j = j
+                    elif lj == best_len and lj > 0 and j > best_j:
+                        best_j = j
+
+                if best_len > 0:
+                    tau_raw = int(succ_line[best_j])
+                    if tau_raw >= 0 and tau_raw <= int(tc_line[t]):
+                        best_L_out[b, r, t] = best_len
+                        tau[b, r, t] = tau_raw
+
+                D_prev = D_curr
+
+    return tau, best_L_out
+
+
+# ---------------------------------------------------------------------------
+# Reference: Shift-And bitset ROSA (using Python integers as bitsets)
+# ---------------------------------------------------------------------------
+
+
+def shift_and_reference(Q, K, cap_end, successor, Lmax: int, sigma: int, tau_cap=None):
+    """Shift-And bitset reference for tests.
+
+    Uses Python arbitrary-precision integers as bitsets.  For each symbol
+    ``a`` builds ``P_a`` (bit j is 1 iff ``K[j] == a``).  Then iterates
+    ``L = 1..Lmax`` maintaining ``M_L(t)`` — the bitset of K positions
+    whose length-L suffix matches Q ending at position ``t``.
+
+    The rightmost set bit of ``M_L(t) & prefix_mask(cap_end[t])`` is the
+    raw match end ``j``.  Every semantic detail (longest first, rightmost
+    tie-break, ROSA successor gating, no backtracking) is reproduced.
+    """
+    Q = np.asarray(Q)
+    K = np.asarray(K)
+    cap_end = np.asarray(cap_end)
+    successor = np.asarray(successor)
+    if tau_cap is None:
+        tau_cap = _default_tau_cap(Q.shape)
+    else:
+        tau_cap = np.asarray(tau_cap)
+
+    B, R, T = Q.shape
+    tau = np.full((B, R, T), -1, dtype=np.int64)
+    best_L_out = np.zeros((B, R, T), dtype=np.int32)
+
+    for b in range(B):
+        for r in range(R):
+            q_line = Q[b, r]
+            k_line = K[b, r]
+            cap_line = cap_end[b, r]
+            succ_line = successor[b, r]
+            tc_line = tau_cap[b, r]
+
+            # Build per-symbol position masks.
+            P = [0] * sigma
+            for j in range(T):
+                sym = int(k_line[j])
+                if 0 <= sym < sigma:
+                    P[sym] |= 1 << j
+
+            # cap_masks[t] = bits 0..cap_end[t]-1 set to 1.
+            cap_masks = []
+            for t in range(T):
+                c = max(0, min(int(cap_line[t]), T))
+                cap_masks.append((1 << c) - 1 if c > 0 else 0)
+
+            # M_prev[t] = bitset for length-L match ending at t.
+            # We store only the previous-t M vector; current t depends on
+            # M_prev[t-1].
+            M_prev = [0] * T  # length-0: no match (all zeros)
+
+            raw_best_L = np.zeros(T, dtype=np.int32)
+            raw_best_j = np.full(T, -1, dtype=np.int32)
+
+            for L in range(1, Lmax + 1):
+                M_curr = [0] * T
+                for t in range(T):
+                    q_sym = int(q_line[t])
+                    if q_sym < 0 or q_sym >= sigma:
+                        continue
+                    P_q = P[q_sym]
+                    if L == 1:
+                        M_curr[t] = P_q
+                    else:
+                        if t > 0 and M_prev[t - 1] != 0:
+                            # Shift left by 1: position j in M_prev corresponds
+                            # to a length-(L-1) match ending at K[j-1],
+                            # so a length-L match can end at K[j].
+                            shifted = (M_prev[t - 1] << 1)
+                            M_curr[t] = shifted & P_q
+
+                    if M_curr[t] != 0:
+                        # Rightmost valid j.
+                        masked = M_curr[t] & cap_masks[t]
+                        if masked != 0:
+                            j = masked.bit_length() - 1  # highest set bit
+                            if L > raw_best_L[t]:
+                                raw_best_L[t] = L
+                                raw_best_j[t] = j
+                            elif L == raw_best_L[t] and j > raw_best_j[t]:
+                                raw_best_j[t] = j
+
+                M_prev = M_curr
+
+            # ROSA gating on accumulated best.
+            for t in range(T):
+                if raw_best_L[t] > 0 and raw_best_j[t] >= 0:
+                    tau_raw = int(succ_line[raw_best_j[t]])
+                    if tau_raw >= 0 and tau_raw <= int(tc_line[t]):
+                        best_L_out[b, r, t] = raw_best_L[t]
+                        tau[b, r, t] = tau_raw
+
+    return tau, best_L_out
