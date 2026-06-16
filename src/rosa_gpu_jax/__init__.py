@@ -277,7 +277,8 @@ def _ensure_divisible(B: int, n_devices: int, name: str) -> tuple[int, int]:
     import warnings
     warnings.warn(
         f"{name}: B={B} is not divisible by n_devices={n_devices}; "
-        f"padding to B={padded}"
+        f"padding to B={padded}",
+        stacklevel=2,
     )
     return padded, B
 
