@@ -207,8 +207,14 @@ def _lookup_full_l_rolling_verified_line(
         best_c_idx = jnp.argmax(score, axis=-1).astype(jnp.int32)
         end_L = jnp.take_along_axis(cand_L, best_c_idx[:, None], axis=-1)[:, 0].astype(jnp.int64)
 
-        best_end = jnp.where(raw_hit_L, end_L, best_end)
-        best_L_raw = jnp.where(raw_hit_L, jnp.int32(L), best_L_raw)
+        # Use the actual verified length (len_L) rather than the block-key
+        # length L, since the verifier may have confirmed a longer match.
+        better = raw_hit_L & (
+            (len_L > best_L_raw)
+            | ((len_L == best_L_raw) & (end_L > best_end))
+        )
+        best_end = jnp.where(better, end_L, best_end)
+        best_L_raw = jnp.where(better, len_L, best_L_raw)
 
     # ROSA gating on accumulated best.
     end_safe = jnp.clip(best_end, 0, T - 1)

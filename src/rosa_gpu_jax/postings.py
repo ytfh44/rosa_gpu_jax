@@ -236,13 +236,17 @@ def _lookup_full_l_base_postings_jit(
 
         # Accumulate raw best across L: the verifier already selected the
         # best (longest, rightmost) candidate and verified it
-        # symbol-by-symbol.  Use its raw end position and match length
-        # before gating — ROSA gating is applied once at the end, matching
-        # the pattern in _lookup_full_l_base_jit.
-        best_end = jnp.where(
-            raw_hit_L, end_raw_L.astype(jnp.int64), best_end
+        # symbol-by-symbol.  Use its raw end position and verified match
+        # length before gating — ROSA gating is applied once at the end,
+        # matching the pattern in _lookup_full_l_base_jit.
+        better = raw_hit_L & (
+            (len_raw_L > best_L_raw)
+            | ((len_raw_L == best_L_raw) & (end_raw_L > best_end))
         )
-        best_L_raw = jnp.where(raw_hit_L, jnp.int32(L), best_L_raw)
+        best_end = jnp.where(
+            better, end_raw_L.astype(jnp.int64), best_end
+        )
+        best_L_raw = jnp.where(better, len_raw_L, best_L_raw)
 
     # ROSA gating on the accumulated best raw match.
     end_safe = jnp.clip(best_end, 0, T - 1)
@@ -330,10 +334,14 @@ def _lookup_full_l_rolling_postings_jit(
             & (end_raw_L >= (L - 1))
         )
 
-        best_end = jnp.where(
-            raw_hit_L, end_raw_L.astype(jnp.int64), best_end
+        better = raw_hit_L & (
+            (len_raw_L > best_L_raw)
+            | ((len_raw_L == best_L_raw) & (end_raw_L > best_end))
         )
-        best_L_raw = jnp.where(raw_hit_L, jnp.int32(L), best_L_raw)
+        best_end = jnp.where(
+            better, end_raw_L.astype(jnp.int64), best_end
+        )
+        best_L_raw = jnp.where(better, len_raw_L, best_L_raw)
 
     end_safe = jnp.clip(best_end, 0, T - 1)
     tau_raw = jnp.take_along_axis(successor, end_safe, axis=-1)
