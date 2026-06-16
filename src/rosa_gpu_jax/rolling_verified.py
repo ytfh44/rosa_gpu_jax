@@ -173,15 +173,11 @@ def _lookup_full_l_rolling_verified_line(
             q_keys, table, C=C, num_buckets=num_buckets, L=L
         )  # [T, C]
 
-        # Verify candidates and extract raw best for this L.
-        tau_L, len_L = _verify_candidates_line(
-            q_line, k_line, cand_L, cap_line, succ_line, tcap_line, Lmax=Lmax
-        )
-        raw_hit_L = len_L > 0
-
-        # For the raw accumulation we need the end position.  Derive it from
-        # the candidate that gave the best match.
-        # Reconstruct score to find best candidate index, then extract end.
+        # Verify candidates (for the raw accumulation we need the end position
+        # and the *raw* verified length; ROSA successor gating is applied once
+        # at the end to avoid backtracking).
+        # Reconstruct score to find best candidate index, then extract end
+        # and raw length.
         offsets = jnp.arange(Lmax, dtype=jnp.int32)
         t_idx = jnp.arange(T, dtype=jnp.int32)[:, None, None]  # [T,1,1]
         j_idx = cand_L.astype(jnp.int32)[:, :, None]  # [T,C,1]
@@ -206,15 +202,21 @@ def _lookup_full_l_rolling_verified_line(
         score = lens.astype(jnp.int64) * jnp.asarray(T + 1, dtype=jnp.int64) + j_nonneg
         best_c_idx = jnp.argmax(score, axis=-1).astype(jnp.int32)
         end_L = jnp.take_along_axis(cand_L, best_c_idx[:, None], axis=-1)[:, 0].astype(jnp.int64)
+        raw_len_L = jnp.take_along_axis(lens, best_c_idx[:, None], axis=-1)[:, 0]
 
-        # Use the actual verified length (len_L) rather than the block-key
-        # length L, since the verifier may have confirmed a longer match.
+        raw_hit_L = raw_len_L > 0
+
+        # Use the raw verified length rather than the block-key length L,
+        # since the verifier may have confirmed a longer match.  ROSA
+        # successor / tau_cap gating is deferred to the end of the loop
+        # so that an invalid successor on the longest raw match does not
+        # cause an incorrect fallback to a shorter match.
         better = raw_hit_L & (
-            (len_L > best_L_raw)
-            | ((len_L == best_L_raw) & (end_L > best_end))
+            (raw_len_L > best_L_raw)
+            | ((raw_len_L == best_L_raw) & (end_L > best_end))
         )
         best_end = jnp.where(better, end_L, best_end)
-        best_L_raw = jnp.where(better, len_L, best_L_raw)
+        best_L_raw = jnp.where(better, raw_len_L, best_L_raw)
 
     # ROSA gating on accumulated best.
     end_safe = jnp.clip(best_end, 0, T - 1)
