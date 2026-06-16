@@ -100,7 +100,6 @@ def _verify_candidates_line(q_line, k_line, cand_line, cap_line, succ_line, tcap
     Returns ``(tau[T], best_len[T])`` — ``int64`` and ``int32``.
     """
     T = q_line.shape[-1]
-    C = cand_line.shape[-1]
     offsets = jnp.arange(Lmax, dtype=jnp.int32)
 
     t_idx = jnp.arange(T, dtype=jnp.int32)[:, None, None]  # [T,1,1]

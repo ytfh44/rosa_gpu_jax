@@ -92,7 +92,6 @@ def _postings_one_l_from_keys_end_jit(q_keys, k_keys, cap_end, successor, tau_ca
         # Build per-query raw-hit mask: the first candidate (c=0) is the
         # rightmost and determines whether *any* valid match exists.
         best_j = cand_end[:, 0]  # [T] — rightmost candidate
-        best_j_safe = jnp.clip(best_j, 0, T - 1)
         pos_t = jnp.arange(T, dtype=jnp.int32)
         raw_hit = (
             (best_j >= 0)

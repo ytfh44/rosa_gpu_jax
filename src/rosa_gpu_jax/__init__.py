@@ -312,7 +312,7 @@ def lookup_full_l_base_pmap(
         )
 
     Q_arr = jnp.asarray(Q)
-    B, R, T = Q_arr.shape[0], Q_arr.shape[1], Q_arr.shape[2]
+    B = Q_arr.shape[0]
     padded_B, orig_B = _ensure_divisible(B, n_devices, "lookup_full_l_base_pmap")
 
     def _pmap_body(Q_chunk, K_chunk, cap_chunk, succ_chunk, tcap_chunk):
@@ -364,7 +364,7 @@ def lookup_full_l_rolling_pmap(
         )
 
     Q_arr = jnp.asarray(Q)
-    B, R, T = Q_arr.shape[0], Q_arr.shape[1], Q_arr.shape[2]
+    B = Q_arr.shape[0]
     padded_B, orig_B = _ensure_divisible(B, n_devices, "lookup_full_l_rolling_pmap")
 
     B_per = padded_B // n_devices
