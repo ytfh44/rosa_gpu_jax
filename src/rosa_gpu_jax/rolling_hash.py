@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from rosa_gpu_jax.causal import NEG
-from rosa_gpu_jax.block_table import _lookup_one_l_from_keys_mask_end_jit, _lookup_one_l_from_keys_mask_jit, _lookup_one_l_from_keys_hash_end_jit, _lookup_one_l_from_keys_hash_jit
+from rosa_gpu_jax.block_table import _lookup_one_l_from_keys_mask_end_jit, _lookup_one_l_from_keys_mask_jit, _lookup_one_l_from_keys_hash_end_jit
 from rosa_gpu_jax.validation import (
     require_L_for_T,
     require_Lmax_for_T,

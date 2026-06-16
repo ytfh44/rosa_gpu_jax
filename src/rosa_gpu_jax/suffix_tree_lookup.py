@@ -33,7 +33,6 @@ from rosa_gpu_jax.validation import (
     require_aux,
     require_Lmax_for_T,
     require_rank3_pair,
-    require_sigma,
     require_tau_cap,
 )
 
