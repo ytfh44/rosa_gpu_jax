@@ -32,6 +32,11 @@ from rosa_gpu_jax.postings import (
     lookup_full_l_rolling_postings,
 )
 from rosa_gpu_jax.prefix_table import lookup_full_l_counting_prefix  # exact dense prefix table
+from rosa_gpu_jax.radix_events import (
+    lookup_full_l_radix_events,
+    lookup_full_l_radix_postings,
+    pallas_available,
+)
 from rosa_gpu_jax.rolling_hash import (
     lookup_full_l_rolling,
     lookup_one_l_rolling,
@@ -288,6 +293,41 @@ def warmup(
         if verbose:
             print(f"{t1 - t0:.3f}s")
 
+    # Radix-events warmup (exact + postings).
+    for Lmax in Lmax_values:
+        if Lmax > T:
+            continue
+        for sigma in sigma_values:
+            safe_Lmax = max_exact_L(sigma, T)
+            Lmax_eff = min(Lmax, safe_Lmax)
+            if Lmax_eff < 1:
+                continue
+            Q_re = jnp.full((B, R, T), 0, dtype=jnp.int64)
+            K_re = jnp.full((B, R, T), 1, dtype=jnp.int64)
+            cap_end, successor = make_raw_causal_aux(B, R, T)
+            key_mode = "bitpack" if sigma == 2 else "base"
+            label_re = f"radix_events Lmax={Lmax_eff} sigma={sigma} key_mode={key_mode}"
+            if verbose:
+                print(f"  warming up {label_re} ...", end=" ", flush=True)
+            t0 = time.perf_counter()
+            lookup_full_l_radix_events(
+                Q_re, K_re, cap_end, successor, Lmax=Lmax_eff, sigma=sigma, key_mode=key_mode,
+            )
+            t1 = time.perf_counter()
+            if verbose:
+                print(f"{t1 - t0:.3f}s")
+
+            label_rp = f"radix_postings Lmax={Lmax_eff} sigma={sigma} key_mode={key_mode} C=4"
+            if verbose:
+                print(f"  warming up {label_rp} ...", end=" ", flush=True)
+            t0 = time.perf_counter()
+            lookup_full_l_radix_postings(
+                Q_re, K_re, cap_end, successor, Lmax=Lmax_eff, sigma=sigma, key_mode=key_mode, C=4,
+            )
+            t1 = time.perf_counter()
+            if verbose:
+                print(f"{t1 - t0:.3f}s")
+
 
 # ---- pmap-based multi-GPU wrappers ----
 
@@ -440,6 +480,9 @@ __all__ = [
     "lookup_full_l_rolling_verified",
     "lookup_full_l_bitset",  # experimental
     "lookup_full_l_counting_prefix",  # exact dense prefix table
+    "lookup_full_l_radix_events",
+    "lookup_full_l_radix_postings",
+    "pallas_available",
     "lookup_full_l_diag_dp",  # streaming diagonal-DP
     "lookup_full_l_shift_and",  # Shift-And bitset
     "lookup_full_l_streaming_causal",  # streaming base-key bucket
