@@ -245,6 +245,11 @@ def _sa_lookup_one_line(
             q_pats, cap_line, pos_valid
         )  # [T], [T]
 
+        # Mask out positions where t < L-1: the query pattern was
+        # zero-padded for those positions, and zero is a valid symbol
+        # that could match actual K symbols, creating false positives.
+        hit_L = hit_L & (pos_valid >= (L - 1))
+
         # If this L gives a valid match, it always beats shorter L
         # (since we process in increasing L, and we want longest).
         best_j = jnp.where(hit_L & (jnp.int32(L) > best_L_raw), j_L, best_j)
