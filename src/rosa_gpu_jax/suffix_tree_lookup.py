@@ -220,13 +220,13 @@ def _sa_lookup_one_line(
         q_pats = jnp.where(t_valid, q_pats, jnp.int32(0))  # mask invalid
 
         # For each t, find SA range, then rightmost valid position.
-        def _find_one(q_pat, cap_t, t_pos):
-            lo, hi = _sa_range_for_pattern(q_pat, K_line, SA_line, L=L)
+        def _find_one(q_pat, cap_t, t_pos, _L=L):
+            lo, hi = _sa_range_for_pattern(q_pat, K_line, SA_line, L=_L)
             # Bounded scan: check SA indices lo..hi.
             # SA contains *starting* positions; ROSA needs *end* positions.
             in_range = (scan_idx >= lo) & (scan_idx <= hi)
             start_positions = SA_line[jnp.clip(scan_idx, 0, T - 1)]
-            end_positions = start_positions + jnp.int32(L - 1)  # convert start→end
+            end_positions = start_positions + jnp.int32(_L - 1)  # convert start→end
             valid_pos = (
                 in_range
                 & (start_positions >= 0)
