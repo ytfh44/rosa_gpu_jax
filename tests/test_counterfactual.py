@@ -1,7 +1,8 @@
 import numpy as np
 import jax.numpy as jnp
 
-from rosa_gpu_jax import make_raw_causal_aux, q_bit_counterfactual_tau, lookup_full_l_base
+from rosa_gpu_jax import lookup_full_l_base, make_raw_causal_aux, q_bit_counterfactual_tau
+from rosa_gpu_jax.reference import brute_force_lookup
 
 
 def test_q_bit_counterfactual_shapes_and_identity_branches():
@@ -29,9 +30,6 @@ def test_q_bit_counterfactual_shapes_and_identity_branches():
         bit_is_one = ((Q_np >> m) & 1).astype(bool)
         np.testing.assert_array_equal(tau0_np[m][~bit_is_one], tau_true_np[~bit_is_one])
         np.testing.assert_array_equal(tau1_np[m][bit_is_one], tau_true_np[bit_is_one])
-
-
-from rosa_gpu_jax.reference import brute_force_lookup
 
 
 def test_q_bit_counterfactual_matches_bruteforce_for_each_current_symbol_branch():
