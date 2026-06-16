@@ -1,5 +1,5 @@
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 from rosa_gpu_jax import (
     lookup_full_l_base,

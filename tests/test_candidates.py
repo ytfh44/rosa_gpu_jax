@@ -1,5 +1,5 @@
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 from rosa_gpu_jax import verify_cpu_candidates
 from rosa_gpu_jax.reference import brute_force_candidate_verify

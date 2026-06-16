@@ -35,7 +35,6 @@ from rosa_gpu_jax.validation import (
     require_tau_cap,
 )
 
-
 # ---------------------------------------------------------------------------
 # Single-L postings helper: collect C rightmost candidates per query.
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 
 from rosa_gpu_jax.causal import NEG
-from rosa_gpu_jax.rolling_hash import _rolling_block_keys_u64_jit, _default_num_buckets
+from rosa_gpu_jax.rolling_hash import _default_num_buckets, _rolling_block_keys_u64_jit
 from rosa_gpu_jax.validation import (
     require_aux,
     require_base,
@@ -24,7 +24,6 @@ from rosa_gpu_jax.validation import (
     require_rank3_pair,
     require_tau_cap,
 )
-
 
 # ---------------------------------------------------------------------------
 # Single-line multi-slot hash table builders / probes.

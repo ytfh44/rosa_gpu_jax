@@ -2,14 +2,15 @@
 
 import numpy as np
 import pytest
+
+from rosa_gpu_jax.causal import make_raw_causal_aux, make_rosa_causal_aux
+from rosa_gpu_jax.dp import lookup_full_l_dp
+from rosa_gpu_jax.reference import brute_force_lookup
 from rosa_gpu_jax.suffix_tree_lookup import (
+    _build_sa_one,
     lookup_full_l_sa,
     suffix_array_batch,
-    _build_sa_one,
 )
-from rosa_gpu_jax.causal import make_raw_causal_aux, make_rosa_causal_aux
-from rosa_gpu_jax.reference import brute_force_lookup
-from rosa_gpu_jax.dp import lookup_full_l_dp
 
 
 class TestSuffixArrayBuild:

@@ -17,10 +17,10 @@ from rosa_gpu_jax.causal import NEG
 from rosa_gpu_jax.validation import (
     ensure_exact_key_safe,
     ensure_precomputed_keys_combined_safe,
-    require_L_for_T,
-    require_Lmax_for_T,
     require_aux,
     require_key_array_pair,
+    require_L_for_T,
+    require_Lmax_for_T,
     require_rank3_pair,
     require_sigma,
     require_symbol_array,

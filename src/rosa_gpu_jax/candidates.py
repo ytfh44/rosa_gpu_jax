@@ -9,9 +9,9 @@ import jax.numpy as jnp
 
 from rosa_gpu_jax.causal import NEG, make_raw_causal_aux
 from rosa_gpu_jax.validation import (
-    require_Lmax_for_T,
     require_aux,
     require_int_array,
+    require_Lmax_for_T,
     require_rank3_pair,
     require_tau_cap,
 )

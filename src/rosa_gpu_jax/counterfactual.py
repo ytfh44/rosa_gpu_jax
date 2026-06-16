@@ -7,13 +7,13 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from rosa_gpu_jax.causal import NEG
 from rosa_gpu_jax.block_table import _block_keys_base_jit, _lookup_one_l_from_keys_end_jit
+from rosa_gpu_jax.causal import NEG
 from rosa_gpu_jax.validation import (
     ensure_exact_key_safe,
+    require_aux,
     require_Lmax_for_T,
     require_M,
-    require_aux,
     require_rank3_pair,
     require_sigma,
     require_tau_cap,

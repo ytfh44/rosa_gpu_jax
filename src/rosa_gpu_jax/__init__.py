@@ -13,7 +13,7 @@ import jax.numpy as jnp
 # at import time avoids silent truncation on default JAX installations.
 jax.config.update("jax_enable_x64", True)
 
-from rosa_gpu_jax.causal import NEG, make_raw_causal_aux, make_rosa_causal_aux
+from rosa_gpu_jax.bitset import lookup_full_l_bitset  # experimental
 from rosa_gpu_jax.block_table import (
     block_keys_base,
     lookup_full_l_base,
@@ -21,14 +21,16 @@ from rosa_gpu_jax.block_table import (
     lookup_one_l_from_keys,
 )
 from rosa_gpu_jax.candidates import verify_cpu_candidates
+from rosa_gpu_jax.causal import NEG, make_raw_causal_aux, make_rosa_causal_aux
 from rosa_gpu_jax.counterfactual import q_bit_counterfactual_tau
+from rosa_gpu_jax.diag_dp import lookup_full_l_diag_dp  # streaming diagonal-DP
 from rosa_gpu_jax.dp import lookup_full_l_dp
+from rosa_gpu_jax.dp_tpu import lookup_full_l_dense_tpu  # TPU benchmark
 from rosa_gpu_jax.postings import (
     lookup_full_l_base_postings,
     lookup_full_l_drp_lce,
     lookup_full_l_rolling_postings,
 )
-from rosa_gpu_jax.validation import max_exact_L
 from rosa_gpu_jax.rolling_hash import (
     lookup_full_l_rolling,
     lookup_one_l_rolling,
@@ -36,11 +38,9 @@ from rosa_gpu_jax.rolling_hash import (
     rolling_prefix_u64,
 )
 from rosa_gpu_jax.rolling_verified import lookup_full_l_rolling_verified
-from rosa_gpu_jax.bitset import lookup_full_l_bitset  # experimental
-from rosa_gpu_jax.diag_dp import lookup_full_l_diag_dp  # streaming diagonal-DP
 from rosa_gpu_jax.shift_and import lookup_full_l_shift_and  # Shift-And bitset
-from rosa_gpu_jax.dp_tpu import lookup_full_l_dense_tpu  # TPU benchmark
 from rosa_gpu_jax.suffix_tree_lookup import lookup_full_l_sa, suffix_array_batch  # SA-based
+from rosa_gpu_jax.validation import max_exact_L
 
 
 def warmup(

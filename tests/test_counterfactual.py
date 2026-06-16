@@ -1,5 +1,5 @@
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 from rosa_gpu_jax import lookup_full_l_base, make_raw_causal_aux, q_bit_counterfactual_tau
 from rosa_gpu_jax.reference import brute_force_lookup
