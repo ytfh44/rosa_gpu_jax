@@ -31,6 +31,7 @@ from rosa_gpu_jax.postings import (
     lookup_full_l_drp_lce,
     lookup_full_l_rolling_postings,
 )
+from rosa_gpu_jax.prefix_table import lookup_full_l_counting_prefix  # exact dense prefix table
 from rosa_gpu_jax.rolling_hash import (
     lookup_full_l_rolling,
     lookup_one_l_rolling,
@@ -39,6 +40,7 @@ from rosa_gpu_jax.rolling_hash import (
 )
 from rosa_gpu_jax.rolling_verified import lookup_full_l_rolling_verified
 from rosa_gpu_jax.shift_and import lookup_full_l_shift_and  # Shift-And bitset
+from rosa_gpu_jax.streaming_causal import lookup_full_l_streaming_causal  # streaming base-key bucket
 from rosa_gpu_jax.suffix_tree_lookup import lookup_full_l_sa, suffix_array_batch  # SA-based
 from rosa_gpu_jax.validation import max_exact_L
 
@@ -93,6 +95,26 @@ def warmup(
                 print(f"  warming up {label} ...", end=" ", flush=True)
             t0 = time.perf_counter()
             lookup_full_l_base(Q, K, cap_end, successor, Lmax=Lmax_eff, sigma=sigma)
+            t1 = time.perf_counter()
+            if verbose:
+                print(f"{t1 - t0:.3f}s")
+
+            # Counting-prefix warmup (same constraints as base).
+            label_cp = f"counting_prefix Lmax={Lmax_eff} sigma={sigma}"
+            if verbose:
+                print(f"  warming up {label_cp} ...", end=" ", flush=True)
+            t0 = time.perf_counter()
+            lookup_full_l_counting_prefix(Q, K, cap_end, successor, Lmax=Lmax_eff, sigma=sigma)
+            t1 = time.perf_counter()
+            if verbose:
+                print(f"{t1 - t0:.3f}s")
+
+            # Streaming-causal warmup (same constraints as base, causal-only).
+            label_sc = f"streaming_causal Lmax={Lmax_eff} sigma={sigma}"
+            if verbose:
+                print(f"  warming up {label_sc} ...", end=" ", flush=True)
+            t0 = time.perf_counter()
+            lookup_full_l_streaming_causal(Q, K, cap_end, successor, Lmax=Lmax_eff, sigma=sigma)
             t1 = time.perf_counter()
             if verbose:
                 print(f"{t1 - t0:.3f}s")
@@ -417,8 +439,10 @@ __all__ = [
     "lookup_full_l_rolling_pmap",
     "lookup_full_l_rolling_verified",
     "lookup_full_l_bitset",  # experimental
+    "lookup_full_l_counting_prefix",  # exact dense prefix table
     "lookup_full_l_diag_dp",  # streaming diagonal-DP
     "lookup_full_l_shift_and",  # Shift-And bitset
+    "lookup_full_l_streaming_causal",  # streaming base-key bucket
     "lookup_full_l_dense_tpu",  # TPU benchmark
     "lookup_full_l_sa",  # suffix-array based
     "suffix_array_batch",
